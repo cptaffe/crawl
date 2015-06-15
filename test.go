@@ -13,31 +13,94 @@ import (
 	"sort"
 )
 
+var mapChanges chan func(m map[url.URL]Page)
+
 type Page struct {
 	Url *url.URL
 	Body io.ReadCloser
+	Links []*Page
+	Views int
 }
 
-func ReaderGenerator(pages <-chan Page) (<-chan Page, <-chan error) {
-	ch := make(chan Page)
-	errch := make(chan error)
+func (page *Page) get() error {
+	r, err := http.Get(page.Url.String())
+	if err != nil {
+		return err
+	}
+
+	page.Body = r.Body
+
+	return nil
+}
+
+func (page *Page) genLinks(out chan<- *Page) {
+	go func() {
+		defer page.Body.Close()
+		z := html.NewTokenizer(page.Body)
+		for {
+			tt := z.Next()
+			switch tt {
+			case html.ErrorToken:
+				return
+			case html.StartTagToken, html.EndTagToken:
+				tn, _ := z.TagName()
+				if len(tn) == 1 && tn[0] == 'a' {
+					more := true
+					for more {
+						key, val, m := z.TagAttr()
+						more = m
+						if string(key) == "href" {
+							// Parse URL
+							ur, err := page.Url.Parse(string(val))
+							if err != nil {
+								break
+							}
+
+							go func() {
+								mapChanges <-func(m map[url.URL]Page) {
+									// Only one copy of the page exits,
+									// and it lives in the map
+									p := m[*ur]
+									// Update it with the new url
+									// in case it isn't set
+									p.Url = ur
+									p.Views++
+									m[*ur] = p
+									// Add link to this page's children
+									page.Links = append(page.Links, &p)
+									// Send it on to be updated further
+									// if it hasn't been seen yet
+									if p.Views == 0 {
+										out <- &p
+									}
+								}
+							}()
+						}
+					}
+				}
+			}
+		}
+	}()
+}
+
+func ConnectPages(pages <-chan *Page) <-chan *Page {
+	ch := make(chan *Page)
 
 	// Create goroutines to push ints to channel
 	// regardless of order recieved
 	go func() {
 		var wg sync.WaitGroup
 		for page := range pages {
-			c := make(chan Page)
+			c := make(chan *Page)
 			wg.Add(1)
 			go func() {
 				defer wg.Done() // call wg.Done() after doIO completes
 				page := <-c
-				r, err := http.Get(page.Url.String())
+				// Update page by adding page source
+				err := page.get()
 				if err != nil {
-					errch <- err
 					return
 				}
-				page.Body = r.Body
 				ch <- page
 			}()
 			c <- page
@@ -47,107 +110,57 @@ func ReaderGenerator(pages <-chan Page) (<-chan Page, <-chan error) {
 		// above have completed
 		wg.Wait()
 		close(ch)
-		close(errch)
 	}()
 
 	// return as a read-only channel
-	return ch, errch
+	return ch
 }
 
-func URLGenerator(pages <-chan Page) (<-chan Page, <-chan error) {
-	ch := make(chan Page)
-	ech := make(chan error)
+func LinkGrepPages(in <-chan *Page) <-chan *Page  {
+	ch := make(chan *Page)
 
 	// Create goroutines to push ints to channel
 	// regardless of order recieved
 	go func() {
-		var wg sync.WaitGroup
-		for pg := range pages {
-			c := make(chan Page)
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				// Parse html for anchor tags
-				pg := <-c
-				defer pg.Body.Close()
-				z := html.NewTokenizer(pg.Body)
-				for {
-					tt := z.Next()
-					switch tt {
-					case html.ErrorToken:
-						ech <- z.Err()
-						return
-					case html.StartTagToken, html.EndTagToken:
-						tn, _ := z.TagName()
-						if len(tn) == 1 && tn[0] == 'a' {
-							more := true
-							for more {
-								key, val, m := z.TagAttr()
-								more = m
-								if string(key) == "href" {
-									// Parse URL
-									ur, err := pg.Url.Parse(string(val))
-									if err != nil {
-										ech <- err
-										break
-									}
-									ch <- Page{Url: ur} // href link
-								}
-							}
-						}
-					}
-				}
-			}()
-			c <- pg
+		for page := range in {
+			// Parse html for anchor tags
+			page.genLinks(ch)
 		}
-
-		// Close channel as soon as all the goroutines
-		// above have completed
-		wg.Wait()
-		close(ch)
-		close(ech)
 	}()
 
-	return ch, ech
+	return ch
 }
 
-type sortedMap struct {
-	m map[string]int
-	s []string
+type pageList []Page
+
+func (p pageList) Swap(i, j int) {
+	p[i], p[j] = p[j], p[i]
 }
 
-func (sm *sortedMap) Len() int {
-	return len(sm.m)
+func (p pageList) Len() int {
+	return len(p)
 }
 
-func (sm *sortedMap) Less(i, j int) bool {
-	return sm.m[sm.s[i]] > sm.m[sm.s[j]]
-}
-
-func (sm *sortedMap) Swap(i, j int) {
-	sm.s[i], sm.s[j] = sm.s[j], sm.s[i]
-}
-
-func sortedKeys(m map[string]int) []string {
-	sm := new(sortedMap)
-	sm.m = m
-	sm.s = make([]string, len(m))
-	i := 0
-	for key, _ := range m {
-		sm.s[i] = key
-		i++
-	}
-	sort.Sort(sm)
-	return sm.s
+func (p pageList) Less(i, j int) bool {
+	return p[i].Views < p[j].Views
 }
 
 func main() {
-	ch := make(chan Page)
-	srch := make(chan Page)
+	urloverseer := make(chan *Page)
 
-	rch, _ := ReaderGenerator(ch)
-	sch, _ := URLGenerator(srch)
+	mapChanges = make(chan func(m map[url.URL]Page))
+	frequencyMap := make(map[url.URL]Page)
+	go func() {
+		for f := range mapChanges {
+			f(frequencyMap)
+		}
+	}()
 
+	// Page pipeline
+	pages := ConnectPages(urloverseer)
+	urls := LinkGrepPages(pages)
+
+	var rootPage *Page
 	if len(os.Args) == 2 {
 		ur, err := url.Parse(os.Args[1])
 		if err != nil {
@@ -155,13 +168,12 @@ func main() {
 		}
 
 		// Initial page to start crawler
-		ch <- Page{Url: ur}
+		rootPage = &Page{Url: ur}
+		urloverseer <- rootPage
 	} else {
 		fmt.Println("Needs url to start crawler")
 		os.Exit(1)
 	}
-
-	frequencyMap := make(map[string]int)
 
 	c := make(chan os.Signal)
 	signal.Notify(c, os.Interrupt)
@@ -169,31 +181,21 @@ func main() {
 	for {
 		select {
 		case _ = <-c:
-			// Get top 100 url strings
-			sk := sortedKeys(frequencyMap)
-			for i, str := range sk {
-				maxlen := 50
-				if i < 100 {
-					if (len(str) > maxlen) {
-						fmt.Printf("%d: %d Views, %s...\n", i, frequencyMap[str], str[:maxlen - 3])
-					} else {
-						fmt.Printf("%d: %d Views, %s\n", i, frequencyMap[str], str)
-					}
-				}
-				fd, _ := os.Open("out.log")
-				fmt.Fprintf(fd, "%d: %d Views, %s\n", i, frequencyMap[str], str)
+			pages := make(pageList, len(frequencyMap))
+			i := 0
+			for _, p := range frequencyMap {
+				pages[i] = p
+				i++
 			}
+			sort.Sort(pages)
+
+			for i, p := range pages {
+				fmt.Printf("%d: Views %d: %s\n", i, p.Views, p.Url)
+			}
+
 			return
-		case rdr := <-rch:
-			srch <- rdr
-		case str := <- sch:
-			// keep track of most seen
-			visits := frequencyMap[str.Url.String()]
-			frequencyMap[str.Url.String()] = visits + 1
-			if (visits == 0) {
-				// Don't visit something more than once
-				ch <- str
-			}
+		case page := <- urls:
+			urloverseer <- page
 		}
 	}
 }
