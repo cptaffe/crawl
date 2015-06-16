@@ -173,6 +173,8 @@ func main() {
 	done := make(chan os.Signal)
 	signal.Notify(done, os.Interrupt)
 
+
+	totalViews := 0
 	for {
 		select {
 		case <-done:
@@ -208,6 +210,8 @@ func main() {
 			p := frequencyMap[*page.Url]
 			// Update view count
 			page.Views = p.Views + 1
+			totalViews++
+			fmt.Printf("Total Views: %d\r", totalViews)
 			frequencyMap[*page.Url] = *page
 
 			// fmt.Printf("Url (%d): %s\n", page.Views, page.Url.String())
