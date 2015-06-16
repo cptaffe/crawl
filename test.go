@@ -1,41 +1,53 @@
 package main
 
 import (
-	"sync"
-	"io"
 	"fmt"
+	"golang.org/x/net/html"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
-	"golang.org/x/net/html"
 	"os"
 	"os/signal"
 	"sort"
+	"sync"
+	"time"
 )
 
-var mapChanges chan func(m map[url.URL]Page)
+var requestTimeout = time.Duration(5 * time.Second)
 
 type Page struct {
-	Url *url.URL
-	Body io.ReadCloser
-	Links []*Page
+	Url   *url.URL
+	Body  io.ReadCloser
 	Views int
 }
 
 func (page *Page) get() error {
-	r, err := http.Get(page.Url.String())
+	transport := http.Transport{
+		Dial: func(network, addr string) (net.Conn, error) {
+			return net.DialTimeout(network, addr, requestTimeout)
+		},
+	}
+
+	client := http.Client{
+		Transport: &transport,
+	}
+
+	resp, err := client.Get(page.Url.String())
 	if err != nil {
 		return err
 	}
 
-	page.Body = r.Body
+	page.Body = resp.Body
 
 	return nil
 }
 
-func (page *Page) genLinks(out chan<- *Page) {
+func (page *Page) genLinks(wg sync.WaitGroup, out chan<- *Page) {
 	go func() {
 		defer page.Body.Close()
+		defer wg.Done()
 		z := html.NewTokenizer(page.Body)
 		for {
 			tt := z.Next()
@@ -56,25 +68,9 @@ func (page *Page) genLinks(out chan<- *Page) {
 								break
 							}
 
-							go func() {
-								mapChanges <-func(m map[url.URL]Page) {
-									// Only one copy of the page exits,
-									// and it lives in the map
-									p := m[*ur]
-									// Update it with the new url
-									// in case it isn't set
-									p.Url = ur
-									p.Views++
-									m[*ur] = p
-									// Add link to this page's children
-									page.Links = append(page.Links, &p)
-									// Send it on to be updated further
-									// if it hasn't been seen yet
-									if p.Views == 0 {
-										out <- &p
-									}
-								}
-							}()
+							var p Page
+							p.Url = ur
+							out <- &p
 						}
 					}
 				}
@@ -116,16 +112,21 @@ func ConnectPages(pages <-chan *Page) <-chan *Page {
 	return ch
 }
 
-func LinkGrepPages(in <-chan *Page) <-chan *Page  {
+func LinkGrepPages(in <-chan *Page) <-chan *Page {
 	ch := make(chan *Page)
+	var wg sync.WaitGroup
 
 	// Create goroutines to push ints to channel
 	// regardless of order recieved
 	go func() {
 		for page := range in {
+			wg.Add(1)
 			// Parse html for anchor tags
-			page.genLinks(ch)
+			page.genLinks(wg, ch)
 		}
+
+		wg.Wait()
+		close(ch)
 	}()
 
 	return ch
@@ -148,54 +149,73 @@ func (p pageList) Less(i, j int) bool {
 func main() {
 	urloverseer := make(chan *Page)
 
-	mapChanges = make(chan func(m map[url.URL]Page))
 	frequencyMap := make(map[url.URL]Page)
-	go func() {
-		for f := range mapChanges {
-			f(frequencyMap)
-		}
-	}()
 
 	// Page pipeline
 	pages := ConnectPages(urloverseer)
 	urls := LinkGrepPages(pages)
 
-	var rootPage *Page
-	if len(os.Args) == 2 {
-		ur, err := url.Parse(os.Args[1])
-		if err != nil {
-			log.Fatal(err)
-		}
+	if len(os.Args) > 1 {
+		for _, arg := range os.Args {
+			ur, err := url.Parse(arg)
+			if err != nil {
+				log.Fatal(err)
+			}
 
-		// Initial page to start crawler
-		rootPage = &Page{Url: ur}
-		urloverseer <- rootPage
+			// Initial page to start crawler
+			urloverseer <- &Page{Url: ur}
+		}
 	} else {
 		fmt.Println("Needs url to start crawler")
-		os.Exit(1)
+		return
 	}
 
-	c := make(chan os.Signal)
-	signal.Notify(c, os.Interrupt)
+	done := make(chan os.Signal)
+	signal.Notify(done, os.Interrupt)
 
 	for {
 		select {
-		case _ = <-c:
+		case <-done:
+			fmt.Println("Preparing results")
 			pages := make(pageList, len(frequencyMap))
 			i := 0
-			for _, p := range frequencyMap {
+			for u, p := range frequencyMap {
 				pages[i] = p
+				// Save memory by removing
+				delete(frequencyMap, u)
 				i++
 			}
 			sort.Sort(pages)
 
-			for i, p := range pages {
-				fmt.Printf("%d: Views %d: %s\n", i, p.Views, p.Url)
+			sz := 0
+			if len(pages) > 100 {
+				sz = len(pages) - 100
 			}
 
+			for i, p := range pages[sz:] {
+				fmt.Printf("%d: Views %d: %s\n", 100-i, p.Views, p.Url)
+			}
 			return
-		case page := <- urls:
-			urloverseer <- page
+		case page := <-urls:
+
+			// Only request absolute urls, and no stupid javascript
+			js := "javascript"
+			if !page.Url.IsAbs() || (len(page.Url.String()) >= len(js) &&  page.Url.String()[:len(js)] == js) {
+				break
+			}
+
+			// Add to map
+			p := frequencyMap[*page.Url]
+			// Update view count
+			page.Views = p.Views + 1
+			frequencyMap[*page.Url] = *page
+
+			// fmt.Printf("Url (%d): %s\n", page.Views, page.Url.String())
+
+			// Only visit a website once
+			if page.Views == 1 {
+				urloverseer <- page
+			}
 		}
 	}
 }
