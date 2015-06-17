@@ -54,7 +54,7 @@ func (page *Page) genLinks(wg sync.WaitGroup, out chan<- *Page) {
 			switch tt {
 			case html.ErrorToken:
 				return
-			case html.StartTagToken, html.EndTagToken:
+			case html.StartTagToken:
 				tn, _ := z.TagName()
 				if len(tn) == 1 && tn[0] == 'a' {
 					more := true
@@ -156,10 +156,10 @@ func main() {
 	urls := LinkGrepPages(pages)
 
 	if len(os.Args) > 1 {
-		for _, arg := range os.Args {
+		for _, arg := range os.Args[1:] {
 			ur, err := url.Parse(arg)
 			if err != nil {
-				log.Fatal(err)
+				log.Fatal(fmt.Sprintf("Can't parse url \"%s\": %s", err))
 			}
 
 			// Initial page to start crawler
