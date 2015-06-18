@@ -10,11 +10,12 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"sort"
+	"container/heap"
 	"sync"
 	"time"
 )
 
+var displayTopN = int(10)
 var requestTimeout = time.Duration(5 * time.Second)
 
 type Page struct {
@@ -132,24 +133,36 @@ func LinkGrepPages(in <-chan *Page) <-chan *Page {
 	return ch
 }
 
-type pageList []Page
+type pageHeap []*Page
 
-func (p pageList) Swap(i, j int) {
+func (p pageHeap) Swap(i, j int) {
 	p[i], p[j] = p[j], p[i]
 }
 
-func (p pageList) Len() int {
+func (p pageHeap) Len() int {
 	return len(p)
 }
 
-func (p pageList) Less(i, j int) bool {
+func (p pageHeap) Less(i, j int) bool {
 	return p[i].Views < p[j].Views
+}
+
+func (p *pageHeap) Push(x interface{}) {
+	*p = append(*p, x.(*Page))
+}
+
+func (p *pageHeap) Pop() interface{} {
+	old := *p
+	n := len(old)
+	x := old[n-1]
+	*p = old[:n-1]
+	return x
 }
 
 func main() {
 	urloverseer := make(chan *Page)
 
-	frequencyMap := make(map[url.URL]Page)
+	frequencyMap := make(map[url.URL]*Page)
 
 	// Page pipeline
 	pages := ConnectPages(urloverseer)
@@ -179,23 +192,25 @@ func main() {
 		select {
 		case <-done:
 			fmt.Println("Preparing results")
-			pages := make(pageList, len(frequencyMap))
+			pages := &pageHeap{}
+
+			heap.Init(pages)
+
 			i := 0
 			for u, p := range frequencyMap {
-				pages[i] = p
+				heap.Push(pages, p)
 				// Save memory by removing
 				delete(frequencyMap, u)
+
+				if (i > displayTopN) {
+					heap.Pop(pages)
+				}
 				i++
 			}
-			sort.Sort(pages)
 
-			sz := 0
-			if len(pages) > 100 {
-				sz = len(pages) - 100
-			}
-
-			for i, p := range pages[sz:] {
-				fmt.Printf("%d: Views %d: %s\n", 100-i, p.Views, p.Url)
+			for pages.Len() > 0 {
+				p := heap.Pop(pages).(*Page)
+				fmt.Printf("%d: Views %d: %s\n", displayTopN-pages.Len(), p.Views, p.Url)
 			}
 			return
 		case page := <-urls:
@@ -207,17 +222,18 @@ func main() {
 			}
 
 			// Add to map
-			p := frequencyMap[*page.Url]
-			// Update view count
-			page.Views = p.Views + 1
+			if frequencyMap[*page.Url] == nil {
+				// Update view count
+				frequencyMap[*page.Url] = page
+			}
+			frequencyMap[*page.Url].Views++
 			totalViews++
 			fmt.Printf("Total Views: %d\r", totalViews)
-			frequencyMap[*page.Url] = *page
 
 			// fmt.Printf("Url (%d): %s\n", page.Views, page.Url.String())
 
 			// Only visit a website once
-			if page.Views == 1 {
+			if page.Views == 0 {
 				urloverseer <- page
 			}
 		}
